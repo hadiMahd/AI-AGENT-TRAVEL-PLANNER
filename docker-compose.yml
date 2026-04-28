@@ -13,9 +13,33 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql # Mounts your SQL file
+      - ./db-schema.sql:/docker-entrypoint-initdb.d/init-db.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d vectordb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: vault
+    restart: always
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-myroot}
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_ADDR: http://localhost:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-myroot}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY:-}
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./vault-init.sh:/vault-init.sh
+    entrypoint: ["sh", "-c", "vault server -dev & sleep 2 && sh /vault-init.sh && wait"]
+    healthcheck:
+      test: ["CMD", "vault", "status"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -31,6 +55,30 @@ services:
       - "8080:80"
     depends_on:
       db:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    container_name: backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://user:password@db:5432/vectordb
+      DOCUMENTS_DIR: /app/documents
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-myroot}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_STRONG_MODEL: ${AZURE_STRONG_MODEL:-Kimi-K2.6-1}
+      AZURE_CHEAP_MODEL: ${AZURE_CHEAP_MODEL:-DeepSeek-V3.2-1}
+      AZURE_EMBEDDING_MODEL: ${AZURE_EMBEDDING_MODEL:-text-embedding-3-small-1}
+    volumes:
+      - ./documents:/app/documents:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      vault:
         condition: service_healthy
 
 volumes:
