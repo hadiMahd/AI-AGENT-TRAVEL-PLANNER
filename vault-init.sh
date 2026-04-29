@@ -49,10 +49,10 @@ echo "Vault is ready. Seeding secrets..."
 #   AZURE_OPENAI_KEY → from .env (used by llm.py for Azure API authentication)
 #
 # config.py's _VAULT_KEY_MAP maps these Vault keys back to Settings fields:
-#   "JW-SECRET-KEY"    → settings.jwt_secret_key
+#   "JWT-SECRET-KEY"    → settings.jwt_secret_key
 #   "AZURE-OPENAI-KEY" → settings.azure_openai_key
 vault kv put secret/travel-planner \
-  JW-SECRET-KEY="${JWT_SECRET_KEY}" \
+  JWT-SECRET-KEY="${JWT_SECRET_KEY}" \
   AZURE-OPENAI-KEY="${AZURE_OPENAI_KEY}"
 
 echo "Vault secrets seeded."

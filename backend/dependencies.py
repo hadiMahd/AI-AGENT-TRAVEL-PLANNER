@@ -11,14 +11,22 @@ Current dependencies:
 - get_model:      ML model (scikit-learn, loaded via joblib)
 - get_strong_llm: Azure OpenAI strong model — agent synthesis
 - get_cheap_llm:  Azure OpenAI cheap model — mechanical tasks
-- get_embedder:    Azure OpenAI text-embedding-3-small — RAG pipeline
+- get_embedder:   Azure OpenAI text-embedding-3-small — RAG pipeline
+- get_current_user: JWT-authenticated User ORM object — for protected routes
 """
 
 from typing import Any
 
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from db.session import get_db
+from models.alchemy import User
+from services.auth import decode_token
 from services.ml_inference import ModelNotAvailableError
 
 
@@ -92,6 +100,74 @@ def get_embedder(request: Request) -> OpenAIEmbeddings:
     return embedder
 
 
+# ── Auth: Current User ──────────────────────────────────────────
+
+
+# OAuth2PasswordBearer tells FastAPI to look for "Authorization: Bearer <token>"
+# in the request header. tokenUrl points to our login endpoint so Swagger UI
+# can auto-generate the "Authorize" button.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """
+    Extract and validate the JWT from the Authorization header, then look up the User.
+
+    Flow:
+    1. OAuth2PasswordBearer extracts the token from "Authorization: Bearer <token>"
+    2. decode_token() validates signature + expiration — raises JWTError on failure
+    3. Extract the "sub" claim (user ID) from the payload
+    4. Query the users table for that ID
+    5. Return the User ORM object (or 401 if not found)
+
+    This is the gatekeeper for all protected routes — add it as a Depends()
+    to any endpoint that requires authentication.
+
+    Why not cache the user lookup?
+    - JWT validation is already fast (symmetric key, no DB hit)
+    - The DB hit is a single SELECT by primary key — sub-millisecond
+    - Caching would add complexity and risk stale data (e.g. user deleted)
+
+    Args:
+        token: JWT string extracted from the Authorization header.
+        db:    Async SQLAlchemy session (from Depends(get_db)).
+
+    Returns:
+        User ORM object — the authenticated user.
+
+    Raises:
+        HTTPException 401: if the token is invalid, expired, or user not found.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # Step 1: Decode and validate the JWT
+    try:
+        payload = decode_token(token)
+    except JWTError:
+        raise credentials_exception
+
+    # Step 2: Extract user ID from the "sub" claim
+    user_id: str | None = payload.get("sub")
+    if user_id is None:
+        raise credentials_exception
+
+    # Step 3: Look up the user in the database
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
 # ── Pre-built Depends() objects ──────────────────────────────
 # Use these in route signatures for cleaner code:
 #   async def my_route(llm: ChatOpenAI = StrongLlmDep):
@@ -100,3 +176,4 @@ ModelDep = Depends(get_model)
 StrongLlmDep = Depends(get_strong_llm)
 CheapLlmDep = Depends(get_cheap_llm)
 EmbedderDep = Depends(get_embedder)
+CurrentUserDep = Depends(get_current_user)

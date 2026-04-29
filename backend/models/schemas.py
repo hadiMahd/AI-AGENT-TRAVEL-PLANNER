@@ -1,6 +1,7 @@
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime
 
 
 class TravelStyleFeatures(BaseModel):
@@ -88,6 +89,85 @@ class TravelStylePredictionResponse(BaseModel):
 					"nature_orientation": 0.9,
 					"social_group": 0.1,
 				},
+			}
+		}
+	)
+
+
+class SignupRequest(BaseModel):
+	email: str = Field(
+		...,
+		min_length=1,
+		max_length=255,
+		description="User email address (unique login identifier)",
+	)
+	password: str = Field(
+		...,
+		min_length=6,
+		max_length=128,
+		description="Plaintext password — will be bcrypt-hashed before storage",
+	)
+
+	model_config = ConfigDict(
+		json_schema_extra={
+			"example": {
+				"email": "user@example.com",
+				"password": "secret123",
+			}
+		}
+	)
+
+
+class LoginRequest(BaseModel):
+	email: str = Field(
+		...,
+		min_length=1,
+		max_length=255,
+		description="User email address",
+	)
+	password: str = Field(
+		...,
+		min_length=1,
+		max_length=128,
+		description="Plaintext password to verify against the stored hash",
+	)
+
+	model_config = ConfigDict(
+		json_schema_extra={
+			"example": {
+				"email": "user@example.com",
+				"password": "secret123",
+			}
+		}
+	)
+
+
+class TokenResponse(BaseModel):
+	access_token: str = Field(description="JWT access token (HS256 signed)")
+	token_type: str = Field(default="bearer", description="Token type — always 'bearer'")
+
+	model_config = ConfigDict(
+		json_schema_extra={
+			"example": {
+				"access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+				"token_type": "bearer",
+			}
+		}
+	)
+
+
+class UserOut(BaseModel):
+	id: str
+	email: str
+	created_at: datetime | None = None
+
+	model_config = ConfigDict(
+		from_attributes=True,
+		json_schema_extra={
+			"example": {
+				"id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+				"email": "user@example.com",
+				"created_at": "2026-04-29T12:00:00+00:00",
 			}
 		}
 	)

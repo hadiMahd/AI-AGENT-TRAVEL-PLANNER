@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Only secrets that are stored in Vault are listed here.
 # When Vault is reachable, these values override the ones from .env.
 _VAULT_KEY_MAP: dict[str, str] = {
-    "JW-SECRET-KEY": "jwt_secret_key",
+    "JWT-SECRET-KEY": "jwt_secret_key",
     "AZURE-OPENAI-KEY": "azure_openai_key",
 }
 
