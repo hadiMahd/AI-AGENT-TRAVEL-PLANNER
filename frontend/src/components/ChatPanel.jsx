@@ -1,29 +1,35 @@
 import { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Send, Loader2 } from "lucide-react";
+import { Send, Square, Loader2 } from "lucide-react";
 import { sendChat, sendPlanEmail, getToken } from "../api";
 import ChatMessage from "./ChatMessage";
 
-export default function ChatPanel() {
+export default function ChatPanel({ initialState, onSave }) {
   const navigate = useNavigate();
-  const [messages, setMessages] = useState([]);
+
+  const [messages, setMessages] = useState(initialState?.messages || []);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState(null);
-  const [originCountry, setOriginCountry] = useState(null);
-  const [chatHistory, setChatHistory] = useState([]);
+  const [originCountry, setOriginCountry] = useState(initialState?.originCountry || null);
+  const [chatHistory, setChatHistory] = useState(initialState?.chatHistory || []);
+  const sessionIdRef = useRef(initialState?.id || null);
 
-  // Email flow state
-  const [pendingEmail, setPendingEmail] = useState(null); // { plan, destination }
-  const [lastPlan, setLastPlan] = useState(null);         // persists after user presses No
+  const [pendingEmail, setPendingEmail] = useState(null);
+  const [lastPlan, setLastPlan] = useState(null);
   const [emailInput, setEmailInput] = useState("");
   const [emailLoading, setEmailLoading] = useState(false);
 
   const bottomRef = useRef(null);
+  const abortRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  function handleStop() {
+    abortRef.current?.abort();
+  }
 
   async function handleSend(e) {
     e.preventDefault();
@@ -32,7 +38,6 @@ export default function ChatPanel() {
 
     setInput("");
 
-    // Intercept email-send requests locally — no need to hit the agent
     const lower = text.toLowerCase();
     const isEmailRequest =
       lastPlan &&
@@ -57,13 +62,13 @@ export default function ChatPanel() {
 
     setMessages((prev) => [...prev, { role: "user", content: text }]);
 
-    // Capture origin before async state update so sendChat gets the right value
     const originForThisRequest = pendingQuestion ? text : originCountry;
     if (pendingQuestion) {
       setOriginCountry(text);
       setPendingQuestion(null);
     }
 
+    abortRef.current = new AbortController();
     setLoading(true);
 
     try {
@@ -88,12 +93,7 @@ export default function ChatPanel() {
           });
           setMessages((prev) => [
             ...prev.filter((m) => m.role !== "thinking" && !(m.role === "agent" && m.streaming)),
-            {
-              role: "agent",
-              content: "",
-              toolLogs: [...toolLogs],
-              streaming: true,
-            },
+            { role: "agent", content: "", toolLogs: [...toolLogs], streaming: true },
           ]);
         } else if (event.type === "tool_result") {
           const idx = toolLogs.findIndex((t) => t.tool_name === event.data.tool);
@@ -107,22 +107,14 @@ export default function ChatPanel() {
           }
           setMessages((prev) => [
             ...prev.filter((m) => m.role !== "thinking" && !(m.role === "agent" && m.streaming)),
-            {
-              role: "agent",
-              content: "",
-              toolLogs: [...toolLogs],
-              streaming: true,
-            },
+            { role: "agent", content: "", toolLogs: [...toolLogs], streaming: true },
           ]);
         } else if (event.type === "token") {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (last && last.role === "agent" && last.streaming) {
               const updated = [...prev];
-              updated[updated.length - 1] = {
-                ...last,
-                content: last.content + event.data.text,
-              };
+              updated[updated.length - 1] = { ...last, content: last.content + event.data.text };
               return updated;
             }
             return [
@@ -136,73 +128,72 @@ export default function ChatPanel() {
         } else if (event.type === "final") {
           agentResponse = event.data.response;
           const finalLogs = event.data.tool_logs || toolLogs;
-          setMessages((prev) => [
-            ...prev.filter((m) => m.role !== "thinking" && !(m.role === "agent" && m.streaming)),
-            {
-              role: "agent",
-              content: agentResponse,
-              toolLogs: finalLogs,
-              streaming: false,
-            },
-          ]);
+          setMessages((prev) => {
+            const updated = [
+              ...prev.filter((m) => m.role !== "thinking" && !(m.role === "agent" && m.streaming)),
+              { role: "agent", content: agentResponse, toolLogs: finalLogs, streaming: false },
+            ];
+            // persist session after state settles
+            const newHistory = [
+              ...chatHistory,
+              { role: "user", content: text },
+              { role: "assistant", content: agentResponse },
+            ];
+            if (!sessionIdRef.current) sessionIdRef.current = Date.now().toString();
+            const firstUserMsg = updated.find((m) => m.role === "user");
+            const title = firstUserMsg
+              ? firstUserMsg.content.slice(0, 40)
+              : "Untitled chat";
+            onSave?.({
+              id: sessionIdRef.current,
+              title,
+              messages: updated,
+              chatHistory: newHistory,
+              originCountry: originForThisRequest,
+              ts: Date.now(),
+            });
+            setChatHistory(newHistory);
+            return updated;
+          });
         } else if (event.type === "ask_email") {
           emailAskData = event.data;
           setLastPlan({ plan: event.data.plan, destination: event.data.destination || "" });
         }
-      });
+      }, abortRef.current.signal);
 
       if (needsInput && userQuestion) {
         setPendingQuestion(userQuestion);
         setMessages((prev) => [
           ...prev.filter((m) => m.role !== "thinking"),
-          {
-            role: "agent",
-            content: userQuestion,
-            toolLogs: [],
-            streaming: false,
-            isQuestion: true,
-          },
+          { role: "agent", content: userQuestion, toolLogs: [], streaming: false, isQuestion: true },
         ]);
         setChatHistory((prev) => [
           ...prev,
           { role: "user", content: text },
           { role: "assistant", content: userQuestion },
         ]);
-      } else if (agentResponse) {
-        setChatHistory((prev) => [
+      } else if (agentResponse && emailAskData) {
+        setPendingEmail({ plan: emailAskData.plan, destination: emailAskData.destination || "" });
+        setMessages((prev) => [
           ...prev,
-          { role: "user", content: text },
-          { role: "assistant", content: agentResponse },
+          {
+            role: "agent",
+            content: emailAskData.question,
+            toolLogs: [],
+            streaming: false,
+            isEmailAsk: true,
+          },
         ]);
-
-        // Show email prompt after travel plan
-        if (emailAskData) {
-          setPendingEmail({ plan: emailAskData.plan, destination: emailAskData.destination || "" });
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "agent",
-              content: emailAskData.question,
-              toolLogs: [],
-              streaming: false,
-              isEmailAsk: true,
-            },
-          ]);
-        }
       }
     } catch (err) {
+      if (err.name === "AbortError") return;
       if (err.message.includes("Session expired") || err.message.includes("Not authenticated")) {
         navigate("/login", { replace: true });
         return;
       }
       setMessages((prev) => [
         ...prev.filter((m) => m.role !== "thinking"),
-        {
-          role: "agent",
-          content: `Error: ${err.message}`,
-          toolLogs: [],
-          streaming: false,
-        },
+        { role: "agent", content: `Error: ${err.message}`, toolLogs: [], streaming: false },
       ]);
     } finally {
       setLoading(false);
@@ -220,7 +211,6 @@ export default function ChatPanel() {
     e.preventDefault();
     const email = emailInput.trim();
     if (!email || !pendingEmail) return;
-
     setEmailLoading(true);
     try {
       await sendPlanEmail(email, pendingEmail.plan, pendingEmail.destination);
@@ -238,12 +228,7 @@ export default function ChatPanel() {
     } catch (err) {
       setMessages((prev) => [
         ...prev.filter((m) => !m.isEmailAsk),
-        {
-          role: "agent",
-          content: `Couldn't send the email: ${err.message}`,
-          toolLogs: [],
-          streaming: false,
-        },
+        { role: "agent", content: `Couldn't send the email: ${err.message}`, toolLogs: [], streaming: false },
       ]);
       setPendingEmail(null);
       setEmailInput("");
@@ -284,7 +269,6 @@ export default function ChatPanel() {
         <div ref={bottomRef} />
       </div>
 
-      {/* Email input bar — shown after user taps Yes */}
       {pendingEmail && messages.some((m) => m.emailAccepted) ? (
         <form onSubmit={handleEmailSubmit} className="chat-input-bar">
           <input
@@ -310,16 +294,17 @@ export default function ChatPanel() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={
-              pendingQuestion
-                ? pendingQuestion
-                : "Ask about a travel destination..."
-            }
+            placeholder={pendingQuestion ?? "Ask about a travel destination..."}
             disabled={loading}
             className="chat-input"
           />
-          <button type="submit" disabled={loading || !input.trim()} className="chat-send">
-            <Send size={18} />
+          <button
+            type={loading ? "button" : "submit"}
+            onClick={loading ? handleStop : undefined}
+            disabled={!loading && !input.trim()}
+            className={`chat-send${loading ? " chat-send--stop" : ""}`}
+          >
+            {loading ? <Square size={18} /> : <Send size={18} />}
           </button>
         </form>
       )}

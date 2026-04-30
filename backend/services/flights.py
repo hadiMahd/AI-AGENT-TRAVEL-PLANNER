@@ -116,7 +116,7 @@ def _search_sync(query: str) -> list[dict[str, Any]]:
     in asyncio.to_thread to avoid blocking the event loop.
     """
     with DDGS() as ddgs:
-        raw = list(ddgs.text(query, max_results=5))
+        raw = list(ddgs.text(query, max_results=3))
 
     return [
         {

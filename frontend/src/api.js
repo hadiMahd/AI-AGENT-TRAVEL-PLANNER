@@ -111,7 +111,7 @@ export async function sendPlanEmail(email, plan, destination) {
   });
 }
 
-export async function sendChat(query, originCountry, history, onEvent) {
+export async function sendChat(query, originCountry, history, onEvent, signal) {
   const token = getToken();
   if (!token) throw new Error("Not authenticated");
 
@@ -127,6 +127,7 @@ export async function sendChat(query, originCountry, history, onEvent) {
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (res.status === 401) {
@@ -144,6 +145,7 @@ export async function sendChat(query, originCountry, history, onEvent) {
   let buffer = "";
 
   while (true) {
+    if (signal?.aborted) { reader.cancel(); break; }
     const { done, value } = await reader.read();
     if (done) break;
 

@@ -69,7 +69,7 @@ services:
       AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY:-}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_STRONG_MODEL: ${AZURE_STRONG_MODEL:-Kimi-K2.6-1}
-      AZURE_CHEAP_MODEL: ${AZURE_CHEAP_MODEL:-DeepSeek-V3.2-1}
+      AZURE_CHEAP_MODEL: ${AZURE_CHEAP_MODEL:-o4-mini}
       AZURE_EMBEDDING_MODEL: ${AZURE_EMBEDDING_MODEL:-text-embedding-3-small-1}
     volumes:
       - ./documents:/app/documents:ro

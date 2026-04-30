@@ -2,10 +2,9 @@
 Agent graph — the travel planner's orchestration engine.
 
 Flow:
-  classify_intent ─┬─► casual_reply ─────────────────► END
-                   ├─► quick_info_run ───────────────► END
-                   └─► rewrite_query ─► check_inputs ─┬─► route_and_run_tools ─► END
-                                                      └─► END (needs_user_input)
+  classify_intent ─┬─► casual_reply ────────────────────────────────► END
+                   └─► check_context ─┬─► needs_user_input ──────────► END
+                                      └─► route_and_run_tools ────────► END
 
 Tools are executed as plain async functions — runtime deps (embedder, db, model)
 are bound at graph build time. The allowlist still validates tool names before
@@ -32,9 +31,6 @@ from agent.prompts import (
     CASUAL_REPLY_PROMPT,
     CHECK_INPUTS_PROMPT,
     CLASSIFY_INTENT_PROMPT,
-    INFO_SYNTHESIS_PROMPT,
-    QUICK_TOOL_PROMPT,
-    REWRITE_PROMPT,
     ROUTE_PROMPT,
     SYNTHESIS_PROMPT,
 )
@@ -50,8 +46,6 @@ from tools import validate_tool
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_CHARS = 400  # retained for router fallback when injecting full data
-
 _DEST_KEYWORDS = (
     "trip", "travel", "visit", "plan", "vacation", "holiday", "tour",
     "fly", "flight", "weather", "currency", "exchange", "hotel", "from", "to",
@@ -65,7 +59,12 @@ def _has_destination_keyword(query: str) -> bool:
 
 
 def _build_working_summary(state: AgentState) -> str:
-    """Compress conversation context to a single line for cheap-model prompts."""
+    """Compress conversation context for cheap-model prompts.
+
+    Carries forward facts/preferences the user mentioned in earlier turns
+    (budget, kids, adventure, etc.) so prompts that only see the current
+    query can still extract structured signal.
+    """
     history = state.get("history") or []
     parts: list[str] = []
     if state.get("origin_country"):
@@ -73,15 +72,23 @@ def _build_working_summary(state: AgentState) -> str:
     if state.get("destination_country"):
         parts.append(f"dest={state['destination_country']}")
     if history:
-        last_user = next((m for m in reversed(history) if m.get("role") == "user"), None)
-        if last_user:
-            parts.append(f"prev_user={str(last_user.get('content', ''))[:120]}")
+        prior_user_msgs = [
+            str(m.get("content", "")).strip()
+            for m in history
+            if m.get("role") == "user" and str(m.get("content", "")).strip()
+        ]
+        current_query = (state.get("query") or "").strip()
+        if prior_user_msgs and prior_user_msgs[-1] == current_query:
+            prior_user_msgs = prior_user_msgs[:-1]
+        if prior_user_msgs:
+            joined = " || ".join(m[:200] for m in prior_user_msgs[-5:])
+            parts.append(f"prior_user_turns=[{joined}]")
         last_asst = next(
-            (m for m in reversed(history[:-1]) if m.get("role") == "assistant"),
+            (m for m in reversed(history) if m.get("role") == "assistant"),
             None,
         )
         if last_asst:
-            parts.append(f"prev_reply={str(last_asst.get('content', ''))[:80]}")
+            parts.append(f"prev_reply={str(last_asst.get('content', ''))[:120]}")
     return " | ".join(parts)
 
 
@@ -133,7 +140,7 @@ def _summarize(name: str, payload: Any) -> str:
 
 
 async def classify_intent(state: AgentState, cheap_llm: ChatOpenAI) -> dict:
-    """Node 0: Classify query as casual / info / travel."""
+    """Node 0: Classify query as casual or travel."""
     query = state["query"].strip()
 
     # Deterministic pre-filter: very short messages with no travel keyword are casual,
@@ -159,16 +166,14 @@ async def classify_intent(state: AgentState, cheap_llm: ChatOpenAI) -> dict:
 
     parsed = _parse_json_response(response.content)
     intent = (parsed or {}).get("intent", "travel")
-    if intent not in ("casual", "info", "travel", "plan"):
-        intent = "travel"
-    if intent == "plan":
+    if intent not in ("casual", "travel"):
         intent = "travel"
     logger.info("Intent classified as %s: %s", intent.upper(), query[:50])
     return {"intent": intent}
 
 
 async def casual_reply(state: AgentState, cheap_llm: ChatOpenAI) -> dict:
-    """Node 0b: Generate a friendly greeting for casual conversation."""
+    """Node 0b: Generate a friendly reply — handles chitchat and fictional destinations."""
     prompt = CASUAL_REPLY_PROMPT.format(query=state["query"])
     try:
         response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=60)
@@ -180,6 +185,208 @@ async def casual_reply(state: AgentState, cheap_llm: ChatOpenAI) -> dict:
         "final_response": reply,
         "needs_user_input": False,
         "tool_logs": [],
+    }
+
+
+async def check_context(
+    state: AgentState,
+    cheap_llm: ChatOpenAI,
+    embedder: OpenAIEmbeddings,
+    db: AsyncSession,
+) -> dict:
+    """Node 1: Detect destination via embedding; ask only for missing required inputs.
+
+    Three-tier priority for destination determination:
+      1. LLM-determined destination (from prompt output)
+      2. Prior state destination (carried from earlier turns)
+      3. Embedding search result (fresh detection)
+    This prevents origin-like replies (e.g. "lebanon" answering "where from?")
+    from hijacking a previously established destination (e.g. "Maldives").
+    """
+
+    prior_dest = state.get("destination_country")
+    prior_lat = state.get("destination_lat")
+    prior_long = state.get("destination_long")
+
+    # ---- Embedding search: detect destination from current query ----
+    # Always run — it's one cheap API call and provides signal for
+    # "change to Tokyo" cases. The 3-tier priority below determines
+    # which destination actually wins.
+    detected_dest = None
+    detected_lat = None
+    detected_long = None
+    try:
+        query_embedding = await embed_query(embedder, state["query"])
+        results = await similarity_search(db, query_embedding, k=1)
+        if results:
+            meta = results[0].get("metadata", {})
+            detected_dest = meta.get("country")
+            detected_lat = meta.get("latitude")
+            detected_long = meta.get("longitude")
+    except Exception:
+        logger.warning("Embedding search failed — proceeding without destination detection")
+
+    # ---- Build prompt with full context ----
+    summary = _build_working_summary({**state, "destination_country": detected_dest})
+    prompt = CHECK_INPUTS_PROMPT.format(
+        query=state["query"],
+        summary=summary,
+        dest_country=detected_dest or "not detected",
+        prior_destination=prior_dest or "none",
+    )
+
+    try:
+        response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=90)
+        parsed = _parse_json_response(response.content)
+        usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
+    except asyncio.TimeoutError:
+        logger.warning("Check context timed out — asking user for origin")
+        parsed = None
+        usage = {}
+
+    # ---- Three-tier destination determination ----
+    # 1. LLM explicitly sets a destination
+    # 2. Carry forward prior destination from state
+    # 3. Fall back to embedding search result
+    llm_dest = (parsed or {}).get("destination_country")
+    final_dest = llm_dest or prior_dest or detected_dest
+
+    # For lat/long: use prior values when keeping prior destination,
+    # otherwise use the detected ones (they match the embedding result)
+    if final_dest == prior_dest and prior_dest:
+        final_lat = prior_lat
+        final_long = prior_long
+    else:
+        final_lat = detected_lat
+        final_long = detected_long
+
+    base_updates = {
+        "destination_country": final_dest,
+        "destination_lat": final_lat,
+        "destination_long": final_long,
+        "destination_currency": get_currency_for_country(final_dest) if final_dest else None,
+        "rewritten_query": state["query"],
+        "prompt_tokens": state.get("prompt_tokens", 0) + (usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": state.get("completion_tokens", 0) + (usage.get("completion_tokens", 0) or 0),
+    }
+
+    needs_dest = (parsed or {}).get("needs_dest", False)
+    needs_origin = (parsed or {}).get("needs_origin", True)
+    has_origin = (parsed or {}).get("has_origin", False)
+    question = (parsed or {}).get("question")
+
+    # If destination is still unknown after all three tiers, we must ask
+    if needs_dest and not final_dest:
+        prior = state.get("clarification_attempts", 0)
+        return {
+            **base_updates,
+            "origin_country": None,
+            "origin_currency": None,
+            "needs_user_input": True,
+            "user_question": question or "Which destination are you interested in?",
+            "clarification_attempts": prior + 1,
+        }
+
+    # Proceed without asking if origin is not needed, or if it's already known
+    if not needs_origin or has_origin:
+        origin_country = (parsed or {}).get("origin_country") or state.get("origin_country")
+        return {
+            **base_updates,
+            "origin_country": origin_country,
+            "origin_currency": get_currency_for_country(origin_country) if origin_country else None,
+            "needs_user_input": False,
+            "user_question": None,
+            "clarification_attempts": 0,
+        }
+
+    # Origin is needed but not provided — ask the user
+    prior = state.get("clarification_attempts", 0)
+    return {
+        **base_updates,
+        "origin_country": None,
+        "origin_currency": None,
+        "needs_user_input": True,
+        "user_question": question or "Where are you traveling from?",
+        "clarification_attempts": prior + 1,
+    }
+
+
+async def route_and_run_tools(
+    state: AgentState,
+    cheap_llm: ChatOpenAI,
+    model: Any,
+    embedder: OpenAIEmbeddings,
+    db: AsyncSession,
+    emit_callback: Any = None,
+) -> dict:
+    prompt = ROUTE_PROMPT.format(
+        query=state["query"],
+        destination_country=state.get("destination_country") or "Unknown",
+        origin_country=state.get("origin_country") or "Unknown",
+        destination_currency=state.get("destination_currency") or "Unknown",
+        origin_currency=state.get("origin_currency") or "Unknown",
+        summary=_build_working_summary(state) or "(no prior turns)",
+    )
+    try:
+        response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=90)
+    except asyncio.TimeoutError:
+        logger.warning("Route prompt timed out — running rag_retriever only")
+        response = None
+
+    parsed = _parse_json_response(response.content) if response is not None else None
+
+    base_tokens = state.get("prompt_tokens", 0)
+    comp_tokens = state.get("completion_tokens", 0)
+    if response is not None:
+        usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
+        base_tokens += usage.get("prompt_tokens", 0) or 0
+        comp_tokens += usage.get("completion_tokens", 0) or 0
+
+    if not parsed or "tools" not in parsed:
+        logger.warning("Route parsing failed — running rag_retriever only")
+        tools_to_run = [{"name": "rag_retriever", "input": {"query": state["query"], "k": 3}}]
+    else:
+        tools_to_run = parsed["tools"]
+
+    # ---- Fix: force rag_retriever to search by destination, not the raw user query ----
+    # The cheap LLM may pass the raw user message ("lebanon") as the RAG query.
+    # We override it to always search by the established destination country.
+    # Also inject rag_retriever if it's missing and we have a known destination.
+    destination = state.get("destination_country")
+    has_rag = any(t.get("name") == "rag_retriever" for t in tools_to_run)
+    if destination:
+        if not has_rag:
+            tools_to_run.insert(0, {"name": "rag_retriever", "input": {"query": destination, "k": 3}})
+            logger.info("Injected rag_retriever for destination: %s", destination)
+        else:
+            for t in tools_to_run:
+                if t.get("name") == "rag_retriever":
+                    t["input"]["query"] = destination
+                    logger.info("Rerouted rag_retriever query to destination: %s", destination)
+
+    fan_results = await asyncio.gather(*[
+        _run_one_tool(spec, model, embedder, db, emit_callback) for spec in tools_to_run
+    ])
+
+    tool_results: dict[str, str] = {}
+    data: dict[str, Any] = {}
+    tool_logs: list[dict] = []
+    for name, payload, status, log in fan_results:
+        if not name:
+            continue
+        tool_results[name] = status
+        if payload is not None:
+            data[name] = payload
+        if log is not None:
+            tool_logs.append(log)
+
+    return {
+        "tool_results": tool_results,
+        "data": data,
+        "tool_logs": tool_logs,
+        "prompt_tokens": base_tokens,
+        "completion_tokens": comp_tokens,
+        "needs_user_input": False,
     }
 
 
@@ -230,186 +437,6 @@ async def _run_one_tool(
         return name, None, err, log
 
 
-async def quick_info_run(
-    state: AgentState,
-    cheap_llm: ChatOpenAI,
-    model: Any,
-    embedder: OpenAIEmbeddings,
-    db: AsyncSession,
-    emit_callback: Any = None,
-) -> dict:
-    """Node 1b: Pick and run a single tool for quick info queries."""
-    summary = _build_working_summary(state)
-    prompt = QUICK_TOOL_PROMPT.format(query=state["query"], summary=summary)
-    try:
-        response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=60)
-        parsed = _parse_json_response(response.content)
-    except asyncio.TimeoutError:
-        logger.warning("Quick tool routing timed out — falling back to rag_retriever")
-        parsed = None
-
-    if not parsed or "tool" not in parsed:
-        parsed = {"tool": "rag_retriever", "input": {"query": state["query"], "k": 3}}
-
-    spec = {"name": parsed["tool"], "input": parsed.get("input", {})}
-    if not validate_tool(spec["name"]):
-        spec = {"name": "rag_retriever", "input": {"query": state["query"], "k": 3}}
-
-    name, payload, status, log = await _run_one_tool(spec, model, embedder, db, emit_callback)
-    return {
-        "tool_results": {name: status},
-        "data": {name: payload} if payload is not None else {},
-        "tool_logs": [log] if log else [],
-    }
-
-
-async def rewrite_query(state: AgentState, cheap_llm: ChatOpenAI) -> dict:
-    summary = _build_working_summary(state)
-    prompt = REWRITE_PROMPT.format(query=state["query"], summary=summary)
-    try:
-        response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=90)
-    except asyncio.TimeoutError:
-        logger.warning("Rewrite query timed out — using original query")
-        return {
-            "rewritten_query": state["query"],
-            "prompt_tokens": state.get("prompt_tokens", 0),
-            "completion_tokens": state.get("completion_tokens", 0),
-        }
-    rewritten = response.content.strip()
-    logger.info("Query rewritten: %s → %s", state["query"][:50], rewritten[:50])
-    usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
-    return {
-        "rewritten_query": rewritten,
-        "prompt_tokens": state.get("prompt_tokens", 0) + (usage.get("prompt_tokens", 0) or 0),
-        "completion_tokens": state.get("completion_tokens", 0) + (usage.get("completion_tokens", 0) or 0),
-    }
-
-
-async def check_inputs(
-    state: AgentState,
-    cheap_llm: ChatOpenAI,
-    embedder: OpenAIEmbeddings,
-    db: AsyncSession,
-) -> dict:
-    query_embedding = await embed_query(embedder, state["rewritten_query"])
-    results = await similarity_search(db, query_embedding, k=1)
-
-    dest_country = None
-    dest_lat = None
-    dest_long = None
-    if results:
-        meta = results[0].get("metadata", {})
-        dest_country = meta.get("country")
-        dest_lat = meta.get("latitude")
-        dest_long = meta.get("longitude")
-
-    # Summary built with the freshly-resolved destination so the cheap model has it
-    summary = _build_working_summary({**state, "destination_country": dest_country})
-    prompt = CHECK_INPUTS_PROMPT.format(query=state["query"], summary=summary)
-
-    try:
-        response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=90)
-        parsed = _parse_json_response(response.content)
-        usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
-    except asyncio.TimeoutError:
-        logger.warning("Check inputs timed out — asking user for origin")
-        parsed = None
-        usage = {}
-
-    base_updates = {
-        "destination_country": dest_country,
-        "destination_lat": dest_lat,
-        "destination_long": dest_long,
-        "destination_currency": get_currency_for_country(dest_country) if dest_country else None,
-        "prompt_tokens": state.get("prompt_tokens", 0) + (usage.get("prompt_tokens", 0) or 0),
-        "completion_tokens": state.get("completion_tokens", 0) + (usage.get("completion_tokens", 0) or 0),
-    }
-
-    if parsed and parsed.get("has_origin"):
-        origin_country = parsed.get("origin_country")
-        return {
-            **base_updates,
-            "origin_country": origin_country,
-            "origin_currency": get_currency_for_country(origin_country) if origin_country else None,
-            "needs_user_input": False,
-            "user_question": None,
-            "clarification_attempts": 0,
-        }
-
-    prior = state.get("clarification_attempts", 0)
-    return {
-        **base_updates,
-        "origin_country": None,
-        "origin_currency": None,
-        "needs_user_input": True,
-        "user_question": (parsed or {}).get("question") or "Where are you traveling from?",
-        "clarification_attempts": prior + 1,
-    }
-
-
-async def route_and_run_tools(
-    state: AgentState,
-    cheap_llm: ChatOpenAI,
-    model: Any,
-    embedder: OpenAIEmbeddings,
-    db: AsyncSession,
-    emit_callback: Any = None,
-) -> dict:
-    prompt = ROUTE_PROMPT.format(
-        query=state["query"],
-        destination_country=state.get("destination_country") or "Unknown",
-        origin_country=state.get("origin_country") or "Unknown",
-        destination_currency=state.get("destination_currency") or "Unknown",
-        origin_currency=state.get("origin_currency") or "Unknown",
-    )
-    try:
-        response = await asyncio.wait_for(cheap_llm.ainvoke(prompt), timeout=90)
-    except asyncio.TimeoutError:
-        logger.warning("Route prompt timed out — running rag_retriever only")
-        response = None
-
-    parsed = _parse_json_response(response.content) if response is not None else None
-
-    base_tokens = state.get("prompt_tokens", 0)
-    comp_tokens = state.get("completion_tokens", 0)
-    if response is not None:
-        usage = getattr(response, "response_metadata", {}).get("token_usage", {}) or {}
-        base_tokens += usage.get("prompt_tokens", 0) or 0
-        comp_tokens += usage.get("completion_tokens", 0) or 0
-
-    if not parsed or "tools" not in parsed:
-        logger.warning("Route parsing failed — running rag_retriever only")
-        tools_to_run = [{"name": "rag_retriever", "input": {"query": state["rewritten_query"], "k": 3}}]
-    else:
-        tools_to_run = parsed["tools"]
-
-    # Fan-out: run all selected tools concurrently
-    fan_results = await asyncio.gather(*[
-        _run_one_tool(spec, model, embedder, db, emit_callback) for spec in tools_to_run
-    ])
-
-    tool_results: dict[str, str] = {}
-    data: dict[str, Any] = {}
-    tool_logs: list[dict] = []
-    for name, payload, status, log in fan_results:
-        if not name:
-            continue
-        tool_results[name] = status
-        if payload is not None:
-            data[name] = payload
-        if log is not None:
-            tool_logs.append(log)
-
-    return {
-        "tool_results": tool_results,
-        "data": data,
-        "tool_logs": tool_logs,
-        "prompt_tokens": base_tokens,
-        "completion_tokens": comp_tokens,
-        "needs_user_input": False,  # cleared on the memory-aware escape path
-    }
-
-
 async def _execute_tool(
     name: str,
     tool_input: dict,
@@ -421,19 +448,26 @@ async def _execute_tool(
 
     if name == "rag_retriever":
         query = tool_input.get("query", "")
-        k = tool_input.get("k", 5)
+        k = min(tool_input.get("k", 3), 3)
         try:
             query_embedding = await embed_query(embedder, query)
             results = await similarity_search(db, query_embedding, k)
             if not results:
                 return [], "rag_retriever: no documents found"
+            filtered = [
+                r for r in results
+                if r.get("score", 0) >= 0.6
+            ]
+            if not filtered:
+                logger.warning("All RAG results below 0.6 threshold (best: %.3f)", results[0].get("score", 0))
+                return [], "rag_retriever: all results below relevance threshold"
             payload = [
                 {
                     "content": r["content"][:300],
                     "metadata": r["metadata"],
                     "score": round(r["score"], 3),
                 }
-                for r in results
+                for r in filtered
             ]
             return payload, _summarize(name, payload)
         except Exception as exc:
@@ -442,16 +476,9 @@ async def _execute_tool(
 
     if name == "ml_predictor":
         try:
-            features = TravelStyleFeatures(
-                active_movement=tool_input.get("active_movement", 0.5),
-                relaxation=tool_input.get("relaxation", 0.5),
-                cultural_interest=tool_input.get("cultural_interest", 0.5),
-                cost_sensitivity=tool_input.get("cost_sensitivity", 0.5),
-                luxury_preference=tool_input.get("luxury_preference", 0.5),
-                family_friendliness=tool_input.get("family_friendliness", 0.5),
-                nature_orientation=tool_input.get("nature_orientation", 0.5),
-                social_group=tool_input.get("social_group", 0.5),
-            )
+            if not isinstance(tool_input, dict):
+                return None, f"[ml_predictor ERROR] expected dict input, got {type(tool_input).__name__}"
+            features = TravelStyleFeatures(**tool_input)
             payload = await infer_travel_style(model, features)
             return payload, _summarize(name, payload)
         except Exception as exc:
@@ -548,23 +575,15 @@ def build_graph(
     async def _casual(state: AgentState) -> dict:
         return await casual_reply(state, cheap_llm)
 
-    async def _quick_info(state: AgentState) -> dict:
-        return await quick_info_run(state, cheap_llm, model, embedder, db, emit_callback)
-
-    async def _rewrite(state: AgentState) -> dict:
-        return await rewrite_query(state, cheap_llm)
-
     async def _check(state: AgentState) -> dict:
-        return await check_inputs(state, cheap_llm, embedder, db)
+        return await check_context(state, cheap_llm, embedder, db)
 
     async def _route_run(state: AgentState) -> dict:
         return await route_and_run_tools(state, cheap_llm, model, embedder, db, emit_callback)
 
     graph.add_node("classify_intent", _classify)
     graph.add_node("casual_reply", _casual)
-    graph.add_node("quick_info_run", _quick_info)
-    graph.add_node("rewrite_query", _rewrite)
-    graph.add_node("check_inputs", _check)
+    graph.add_node("check_context", _check)
     graph.add_node("route_and_run_tools", _route_run)
 
     graph.set_entry_point("classify_intent")
@@ -572,25 +591,21 @@ def build_graph(
     def _after_classify(state: AgentState) -> str:
         if state.get("intent") == "casual":
             return "casual_reply"
-        if state.get("intent") == "info":
-            return "quick_info_run"
-        return "rewrite_query"
+        return "check_context"
 
     graph.add_conditional_edges("classify_intent", _after_classify)
     graph.add_edge("casual_reply", END)
-    graph.add_edge("quick_info_run", END)
-    graph.add_edge("rewrite_query", "check_inputs")
 
     def _after_check(state: AgentState) -> str:
         if state.get("needs_user_input"):
-            # Memory-aware escape: 3+ failed clarifications -> proceed without origin
+            # Clarification loop guard: after 3 failed attempts, proceed without origin
             if state.get("clarification_attempts", 0) >= 3:
                 logger.warning("Clarification loop detected — proceeding without origin")
                 return "route_and_run_tools"
             return END
         return "route_and_run_tools"
 
-    graph.add_conditional_edges("check_inputs", _after_check)
+    graph.add_conditional_edges("check_context", _after_check)
     graph.add_edge("route_and_run_tools", END)
 
     return graph

@@ -31,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent import build_graph
-from agent.prompts import INFO_SYNTHESIS_PROMPT, SYNTHESIS_PROMPT
+from agent.prompts import SYNTHESIS_PROMPT
 from agent.state import AgentState
 from db.session import get_db
 from dependencies import CheapLlmDep, CurrentUserDep, EmbedderDep, ModelDep, StrongLlmDep
@@ -130,29 +130,36 @@ async def _run_and_stream(
     for name, status in result.get("tool_results", {}).items():
         tool_results_str += f"- {name}: {status}\n"
 
-    if result.get("intent") == "info":
-        # Info queries: include the single tool's compact payload so the strong model
-        # can quote actual numbers (temperatures, rates, etc.).
-        for name, payload in data_dict.items():
-            if payload is None:
-                continue
-            tool_results_str += f"\n{name} data:\n{json.dumps(payload, default=str)[:600]}\n"
-        prompt = INFO_SYNTHESIS_PROMPT.format(tool_results=tool_results_str, query=query)
-    else:
-        # Travel plans: pull richer RAG context for the strong model
-        rag_hits = data_dict.get("rag_retriever")
-        if isinstance(rag_hits, list) and rag_hits:
-            tool_results_str += "\nRAG TOP HITS:\n"
-            for hit in rag_hits[:3]:
-                meta = hit.get("metadata", {}) or {}
-                country = meta.get("country", "?")
-                content = (hit.get("content") or "")[:300]
-                tool_results_str += f"  - {country}: {content}\n"
-        prompt = SYNTHESIS_PROMPT.format(
-            tool_results=tool_results_str,
-            query=query,
-            destination=result.get("destination_country", "the destination"),
-        )
+    # Include full payloads: RAG content + actual numbers from other tools
+    rag_hits = data_dict.get("rag_retriever")
+    if isinstance(rag_hits, list) and rag_hits:
+        tool_results_str += "\nRAG TOP HITS:\n"
+        for hit in rag_hits[:3]:
+            meta = hit.get("metadata", {}) or {}
+            country = meta.get("country", "?")
+            content = (hit.get("content") or "")[:300]
+            tool_results_str += f"  - {country}: {content}\n"
+    for name, payload in data_dict.items():
+        if name == "rag_retriever" or payload is None:
+            continue
+        tool_results_str += f"\n{name} data:\n{json.dumps(payload, default=str)[:600]}\n"
+
+    destination = result.get("destination_country") or "the destination"
+    # Explicit guidance: tools searched by DESTINATION, not raw query words.
+    # The raw query may contain origin ("Beirut") while RAG results are about
+    # the destination ("Maldives"). The strong LLM must plan for the destination.
+    guidance = (
+        f"\nIMPORTANT: All tools searched for the destination: {destination}. "
+        f"Only plan travel for {destination}, even if the raw query mentions "
+        f"other locations (origin, stopovers, etc.).\n"
+    )
+    tool_results_str = guidance + tool_results_str
+
+    prompt = SYNTHESIS_PROMPT.format(
+        tool_results=tool_results_str,
+        query=query,
+        destination=destination,
+    )
 
     # Stream synthesis tokens
     full_text = ""
@@ -176,10 +183,9 @@ async def _run_and_stream(
         f"event: final\ndata: {json.dumps({'response': full_text, 'tool_logs': tool_logs, 'prompt_tokens': prompt_tokens, 'completion_tokens': completion_tokens})}\n\n"
     )
 
-    if result.get("intent") != "info":
-        yield (
-            f"event: ask_email\ndata: {json.dumps({'question': 'Would you like me to send this travel plan to your email?', 'plan': full_text, 'destination': result.get('destination_country', '')})}\n\n"
-        )
+    yield (
+        f"event: ask_email\ndata: {json.dumps({'question': 'Would you like me to send this travel plan to your email?', 'plan': full_text, 'destination': result.get('destination_country', '')})}\n\n"
+    )
 
     # Persist AgentRun + ToolLogs to DB (background)
     background_tasks.add_task(

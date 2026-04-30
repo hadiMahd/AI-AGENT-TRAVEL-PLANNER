@@ -44,7 +44,7 @@ class RAGToolInput(BaseModel):
 @tool(args_schema=RAGToolInput)
 async def rag_retriever(
     query: str,
-    k: int = 5,
+    k: int = 3,
     embedder: OpenAIEmbeddings | None = None,
     db: AsyncSession | None = None,
 ) -> str:
