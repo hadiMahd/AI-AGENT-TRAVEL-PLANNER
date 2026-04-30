@@ -164,7 +164,7 @@ class Settings(BaseSettings):
         default="Kimi-K2.6-1", alias="AZURE_STRONG_MODEL"
     )
     azure_cheap_model: str = Field(
-        default="DeepSeek-V3.2-1", alias="AZURE_CHEAP_MODEL"
+        default="gpt-o4-mini", alias="AZURE_CHEAP_MODEL"
     )
     azure_embedding_model: str = Field(
         default="text-embedding-3-small-1", alias="AZURE_EMBEDDING_MODEL"

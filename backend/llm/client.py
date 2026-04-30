@@ -96,9 +96,7 @@ def create_strong_llm(settings: Settings | None = None) -> ChatOpenAI:
         model=settings.azure_strong_model,
         base_url=settings.azure_openai_endpoint,
         api_key=settings.azure_openai_key,
-        # Temperature defaults to 0.7 in ChatOpenAI —
-        # good for synthesis (some creativity, not random).
-        # Can be overridden per-invoke via .bind(temperature=0.2) if needed.
+        request_timeout=120,
     )
 
 
@@ -133,9 +131,7 @@ def create_cheap_llm(settings: Settings | None = None) -> ChatOpenAI:
         model=settings.azure_cheap_model,
         base_url=settings.azure_openai_endpoint,
         api_key=settings.azure_openai_key,
-        # Lower temperature for mechanical tasks — we want deterministic,
-        # structured output, not creative writing
-        temperature=0.1,
+        request_timeout=120,
     )
 
 

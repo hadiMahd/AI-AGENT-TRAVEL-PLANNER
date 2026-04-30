@@ -44,6 +44,11 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Public accessor for the session factory — used by background tasks."""
+    return _get_session_factory()
+
+
 async def init_db() -> None:
     _get_engine()
 

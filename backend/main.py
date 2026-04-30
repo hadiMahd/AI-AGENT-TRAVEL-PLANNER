@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import get_settings
 from db.session import dispose_db, init_db
 from llm import create_cheap_llm, create_embedder, create_strong_llm
+from routers.agent import router as agent_router
 from routers.auth import router as auth_router
 from routers.health import router as health_router
 from routers.ml_model import router as ml_model_router
@@ -83,6 +84,7 @@ app.include_router(ml_model_router)
 app.include_router(rag_router)
 app.include_router(auth_router)
 app.include_router(user_router)
+app.include_router(agent_router)
 
 # CORS middleware — allows the Vite frontend (localhost:5173) to call the API.
 # Why not allow all origins ("*")?

@@ -176,3 +176,52 @@ class UserOut(BaseModel):
 class APIMessage(BaseModel):
 	message: str
 	details: dict[str, Any] | None = None
+
+
+class HistoryMessage(BaseModel):
+	role: str = Field(description="'user' or 'assistant'")
+	content: str = Field(description="Message content")
+
+
+class ChatRequest(BaseModel):
+	query: str = Field(
+		...,
+		min_length=1,
+		max_length=2000,
+		description="User's travel planning query",
+	)
+	origin_country: str | None = Field(
+		default=None,
+		description="User's origin country (from previous conversation, if known)",
+	)
+	history: list[HistoryMessage] = Field(
+		default=[],
+		description="Prior conversation turns for context",
+	)
+
+	model_config = ConfigDict(
+		json_schema_extra={
+			"example": {
+				"query": "Plan a trip to Bali",
+				"origin_country": None,
+				"history": [],
+			}
+		}
+	)
+
+
+class ToolLogOut(BaseModel):
+	tool_name: str
+	input_payload: dict | None = None
+	output_payload: str | None = None
+	status: str = "success"
+	latency_ms: int | None = None
+
+
+class AgentRunResponse(BaseModel):
+	response: str
+	tool_logs: list[ToolLogOut] = []
+	needs_user_input: bool = False
+	user_question: str | None = None
+	prompt_tokens: int = 0
+	completion_tokens: int = 0
